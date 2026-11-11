@@ -4,48 +4,41 @@ import (
 	"context"
 	"net/url"
 
+	"github.com/gofrs/uuid"
 	jwt "github.com/golang-jwt/jwt/v5"
+	"github.com/supabase/auth/internal/api/shared"
+	"github.com/supabase/auth/internal/ctxkey"
 	"github.com/supabase/auth/internal/models"
 )
 
-type contextKey string
+var (
+	externalProviderTypeKey          = ctxkey.New[string]("external_provider_type")
+	externalProviderEmailOptionalKey = ctxkey.New[bool]("external_provider_allow_no_email")
 
-func (c contextKey) String() string {
-	return "gotrue api context key " + string(c)
-}
-
-const (
-	tokenKey                = contextKey("jwt")
-	inviteTokenKey          = contextKey("invite_token")
-	signatureKey            = contextKey("signature")
-	externalProviderTypeKey = contextKey("external_provider_type")
-	userKey                 = contextKey("user")
-	targetUserKey           = contextKey("target_user")
-	factorKey               = contextKey("factor")
-	sessionKey              = contextKey("session")
-	externalReferrerKey     = contextKey("external_referrer")
-	functionHooksKey        = contextKey("function_hooks")
-	adminUserKey            = contextKey("admin_user")
-	oauthTokenKey           = contextKey("oauth_token") // for OAuth1.0, also known as request token
-	oauthVerifierKey        = contextKey("oauth_verifier")
-	ssoProviderKey          = contextKey("sso_provider")
-	externalHostKey         = contextKey("external_host")
-	flowStateKey            = contextKey("flow_state_id")
+	tokenKey            = ctxkey.New[*jwt.Token]("jwt")
+	inviteTokenKey      = ctxkey.New[string]("invite_token")
+	signatureKey        = ctxkey.New[string]("signature")
+	targetUserKey       = ctxkey.New[*models.User]("target_user")
+	factorKey           = ctxkey.New[*models.Factor]("factor")
+	sessionKey          = ctxkey.New[*models.Session]("session")
+	externalReferrerKey = ctxkey.New[string]("external_referrer")
+	adminUserKey        = ctxkey.New[*models.User]("admin_user")
+	oauthTokenKey       = ctxkey.New[string]("oauth_token") // for OAuth1.0, also known as request token
+	oauthVerifierKey    = ctxkey.New[string]("oauth_verifier")
+	ssoProviderKey      = ctxkey.New[*models.SSOProvider]("sso_provider")
+	externalHostKey     = ctxkey.New[*url.URL]("external_host")
+	oauthClientStateKey = ctxkey.New[uuid.UUID]("oauth_client_state_id")
+	flowStateContextKey = ctxkey.New[*models.FlowState]("flow_state")
 )
 
 // withToken adds the JWT token to the context.
 func withToken(ctx context.Context, token *jwt.Token) context.Context {
-	return context.WithValue(ctx, tokenKey, token)
+	return tokenKey.WithValue(ctx, token)
 }
 
 // getToken reads the JWT token from the context.
 func getToken(ctx context.Context) *jwt.Token {
-	obj := ctx.Value(tokenKey)
-	if obj == nil {
-		return nil
-	}
-
-	return obj.(*jwt.Token)
+	return tokenKey.Value(ctx)
 }
 
 func getClaims(ctx context.Context) *AccessTokenClaims {
@@ -58,186 +51,142 @@ func getClaims(ctx context.Context) *AccessTokenClaims {
 
 // withUser adds the user to the context.
 func withUser(ctx context.Context, u *models.User) context.Context {
-	return context.WithValue(ctx, userKey, u)
+	return shared.WithUser(ctx, u)
 }
 
 // withTargetUser adds the target user for linking to the context.
 func withTargetUser(ctx context.Context, u *models.User) context.Context {
-	return context.WithValue(ctx, targetUserKey, u)
+	return targetUserKey.WithValue(ctx, u)
 }
 
 // with Factor adds the factor id to the context.
 func withFactor(ctx context.Context, f *models.Factor) context.Context {
-	return context.WithValue(ctx, factorKey, f)
+	return factorKey.WithValue(ctx, f)
 }
 
 // getUser reads the user from the context.
 func getUser(ctx context.Context) *models.User {
-	if ctx == nil {
-		return nil
-	}
-	obj := ctx.Value(userKey)
-	if obj == nil {
-		return nil
-	}
-	return obj.(*models.User)
+	return shared.GetUser(ctx)
 }
 
 // getTargetUser reads the user from the context.
 func getTargetUser(ctx context.Context) *models.User {
-	if ctx == nil {
-		return nil
-	}
-	obj := ctx.Value(targetUserKey)
-	if obj == nil {
-		return nil
-	}
-	return obj.(*models.User)
+	return targetUserKey.Value(ctx)
 }
 
 // getFactor reads the factor id from the context
 func getFactor(ctx context.Context) *models.Factor {
-	obj := ctx.Value(factorKey)
-	if obj == nil {
-		return nil
-	}
-	return obj.(*models.Factor)
+	return factorKey.Value(ctx)
 }
 
 // withSession adds the session to the context.
 func withSession(ctx context.Context, s *models.Session) context.Context {
-	return context.WithValue(ctx, sessionKey, s)
+	return sessionKey.WithValue(ctx, s)
 }
 
 // getSession reads the session from the context.
 func getSession(ctx context.Context) *models.Session {
-	if ctx == nil {
-		return nil
-	}
-	obj := ctx.Value(sessionKey)
-	if obj == nil {
-		return nil
-	}
-	return obj.(*models.Session)
+	return sessionKey.Value(ctx)
 }
 
 // withSignature adds the provided request ID to the context.
 func withSignature(ctx context.Context, id string) context.Context {
-	return context.WithValue(ctx, signatureKey, id)
+	return signatureKey.WithValue(ctx, id)
 }
 
 func withInviteToken(ctx context.Context, token string) context.Context {
-	return context.WithValue(ctx, inviteTokenKey, token)
+	return inviteTokenKey.WithValue(ctx, token)
 }
 
-func withFlowStateID(ctx context.Context, FlowStateID string) context.Context {
-	return context.WithValue(ctx, flowStateKey, FlowStateID)
+func withOAuthClientStateID(ctx context.Context, oauthClientStateID uuid.UUID) context.Context {
+	return oauthClientStateKey.WithValue(ctx, oauthClientStateID)
 }
 
-func getFlowStateID(ctx context.Context) string {
-	obj := ctx.Value(flowStateKey)
-	if obj == nil {
-		return ""
-	}
-	return obj.(string)
+func getOAuthClientStateID(ctx context.Context) uuid.UUID {
+	return oauthClientStateKey.Value(ctx)
+}
+
+// withFlowState stores the entire FlowState object in the context
+func withFlowState(ctx context.Context, flowState *models.FlowState) context.Context {
+	return flowStateContextKey.WithValue(ctx, flowState)
+}
+
+// getFlowState retrieves the FlowState object from the context
+func getFlowState(ctx context.Context) *models.FlowState {
+	return flowStateContextKey.Value(ctx)
 }
 
 func getInviteToken(ctx context.Context) string {
-	obj := ctx.Value(inviteTokenKey)
-	if obj == nil {
-		return ""
-	}
-
-	return obj.(string)
+	return inviteTokenKey.Value(ctx)
 }
 
 // withExternalProviderType adds the provided request ID to the context.
-func withExternalProviderType(ctx context.Context, id string) context.Context {
-	return context.WithValue(ctx, externalProviderTypeKey, id)
+func withExternalProviderType(ctx context.Context, id string, emailOptional bool) context.Context {
+	return externalProviderEmailOptionalKey.WithValue(externalProviderTypeKey.WithValue(ctx, id), emailOptional)
 }
 
-// getExternalProviderType reads the request ID from the context.
-func getExternalProviderType(ctx context.Context) string {
-	obj := ctx.Value(externalProviderTypeKey)
-	if obj == nil {
-		return ""
+// getExternalProviderType returns the provider type and whether user data without email address should be allowed.
+func getExternalProviderType(ctx context.Context) (string, bool) {
+	id, okID := externalProviderTypeKey.Lookup(ctx)
+	if !okID {
+		return "", false
 	}
 
-	return obj.(string)
+	emailOptional, okEmailOptional := externalProviderEmailOptionalKey.Lookup(ctx)
+	if !okEmailOptional {
+		return "", false
+	}
+
+	return id, emailOptional
 }
 
 func withExternalReferrer(ctx context.Context, token string) context.Context {
-	return context.WithValue(ctx, externalReferrerKey, token)
+	return externalReferrerKey.WithValue(ctx, token)
 }
 
 func getExternalReferrer(ctx context.Context) string {
-	obj := ctx.Value(externalReferrerKey)
-	if obj == nil {
-		return ""
-	}
-
-	return obj.(string)
+	return externalReferrerKey.Value(ctx)
 }
 
 // withAdminUser adds the admin user to the context.
 func withAdminUser(ctx context.Context, u *models.User) context.Context {
-	return context.WithValue(ctx, adminUserKey, u)
+	return adminUserKey.WithValue(ctx, u)
 }
 
 // getAdminUser reads the admin user from the context.
 func getAdminUser(ctx context.Context) *models.User {
-	obj := ctx.Value(adminUserKey)
-	if obj == nil {
-		return nil
-	}
-	return obj.(*models.User)
+	return adminUserKey.Value(ctx)
 }
 
 // withRequestToken adds the request token to the context
 func withRequestToken(ctx context.Context, token string) context.Context {
-	return context.WithValue(ctx, oauthTokenKey, token)
+	return oauthTokenKey.WithValue(ctx, token)
 }
 
 func getRequestToken(ctx context.Context) string {
-	obj := ctx.Value(oauthTokenKey)
-	if obj == nil {
-		return ""
-	}
-	return obj.(string)
+	return oauthTokenKey.Value(ctx)
 }
 
 func withOAuthVerifier(ctx context.Context, token string) context.Context {
-	return context.WithValue(ctx, oauthVerifierKey, token)
+	return oauthVerifierKey.WithValue(ctx, token)
 }
 
 func getOAuthVerifier(ctx context.Context) string {
-	obj := ctx.Value(oauthVerifierKey)
-	if obj == nil {
-		return ""
-	}
-	return obj.(string)
+	return oauthVerifierKey.Value(ctx)
 }
 
 func withSSOProvider(ctx context.Context, provider *models.SSOProvider) context.Context {
-	return context.WithValue(ctx, ssoProviderKey, provider)
+	return ssoProviderKey.WithValue(ctx, provider)
 }
 
 func getSSOProvider(ctx context.Context) *models.SSOProvider {
-	obj := ctx.Value(ssoProviderKey)
-	if obj == nil {
-		return nil
-	}
-	return obj.(*models.SSOProvider)
+	return ssoProviderKey.Value(ctx)
 }
 
 func withExternalHost(ctx context.Context, u *url.URL) context.Context {
-	return context.WithValue(ctx, externalHostKey, u)
+	return externalHostKey.WithValue(ctx, u)
 }
 
 func getExternalHost(ctx context.Context) *url.URL {
-	obj := ctx.Value(externalHostKey)
-	if obj == nil {
-		return nil
-	}
-	return obj.(*url.URL)
+	return externalHostKey.Value(ctx)
 }

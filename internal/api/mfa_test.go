@@ -17,6 +17,8 @@ import (
 	"github.com/supabase/auth/internal/api/sms_provider"
 	"github.com/supabase/auth/internal/conf"
 	"github.com/supabase/auth/internal/crypto"
+	"github.com/supabase/auth/internal/mailer"
+	"github.com/supabase/auth/internal/mailer/mockclient"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/utilities"
 
@@ -29,6 +31,7 @@ type MFATestSuite struct {
 	suite.Suite
 	API                  *API
 	Config               *conf.GlobalConfiguration
+	Mailer               mailer.Mailer
 	TestDomain           string
 	TestEmail            string
 	TestOTPKey           *otp.Key
@@ -39,11 +42,13 @@ type MFATestSuite struct {
 }
 
 func TestMFA(t *testing.T) {
-	api, config, err := setupAPIForTest()
+	mockMailer := &mockclient.MockMailer{}
+	api, config, err := setupAPIForTest(WithMailer(mockMailer))
 	require.NoError(t, err)
 	ts := &MFATestSuite{
 		API:    api,
 		Config: config,
+		Mailer: mockMailer,
 	}
 	defer api.db.Close()
 	suite.Run(t, ts)
@@ -89,6 +94,12 @@ func (ts *MFATestSuite) SetupTest() {
 
 	ts.Config.MFA.WebAuthn.EnrollEnabled = true
 	ts.Config.MFA.WebAuthn.VerifyEnabled = true
+	ts.Config.WebAuthn = conf.WebAuthnConfiguration{
+		RPID:                    "localhost",
+		RPDisplayName:           "Test App",
+		RPOrigins:               []string{"http://localhost:3000"},
+		ChallengeExpiryDuration: 5 * time.Minute,
+	}
 
 	key, err := totp.Generate(totp.GenerateOpts{
 		Issuer:      ts.TestDomain,
@@ -517,13 +528,14 @@ func (ts *MFATestSuite) TestMFAVerifyFactor() {
 			var f *models.Factor
 			var sharedSecret string
 
-			if v.factorType == models.TOTP {
+			switch v.factorType {
+			case models.TOTP:
 				friendlyName := uuid.Must(uuid.NewV4()).String()
 				f = models.NewTOTPFactor(ts.TestUser, friendlyName)
 				sharedSecret = ts.TestOTPKey.Secret()
 				f.Secret = sharedSecret
 				require.NoError(ts.T(), ts.API.db.Create(f), "Error updating new test factor")
-			} else if v.factorType == models.Phone {
+			case models.Phone:
 				friendlyName := uuid.Must(uuid.NewV4()).String()
 				numDigits := 10
 				otp := crypto.GenerateOtp(numDigits)
@@ -539,12 +551,13 @@ func (ts *MFATestSuite) TestMFAVerifyFactor() {
 
 			var c *models.Challenge
 			var code string
-			if v.factorType == models.TOTP {
+			switch v.factorType {
+			case models.TOTP:
 				c = f.CreateChallenge(utilities.GetIPAddress(req))
 				// Verify TOTP code
 				code, err = totp.GenerateCode(sharedSecret, time.Now().UTC())
 				require.NoError(ts.T(), err)
-			} else if v.factorType == models.Phone {
+			case models.Phone:
 				code = "123456"
 				c, err = f.CreatePhoneChallenge(utilities.GetIPAddress(req), code, ts.Config.Security.DBEncryption.Encrypt, ts.Config.Security.DBEncryption.EncryptionKeyID, ts.Config.Security.DBEncryption.EncryptionKey)
 				require.NoError(ts.T(), err)
@@ -716,13 +729,9 @@ func (ts *MFATestSuite) TestMFAFollowedByPasswordSignIn() {
 
 func (ts *MFATestSuite) TestChallengeWebAuthnFactor() {
 	factor := models.NewWebAuthnFactor(ts.TestUser, "WebAuthnfactor")
-	validWebAuthnConfiguration := &WebAuthnParams{
-		RPID:      "localhost",
-		RPOrigins: "http://localhost:3000",
-	}
 	require.NoError(ts.T(), ts.API.db.Create(factor), "Error saving new test factor")
 	token := ts.generateAAL1Token(ts.TestUser, &ts.TestSession.ID)
-	w := performChallengeWebAuthnFlow(ts, factor.ID, token, validWebAuthnConfiguration)
+	w := performChallengeWebAuthnFlow(ts, factor.ID, token, &WebAuthnParams{})
 	require.Equal(ts.T(), http.StatusOK, w.Code)
 }
 
@@ -1009,4 +1018,98 @@ func cleanupHook(ts *MFATestSuite, hookName string) {
 	cleanupHookSQL := fmt.Sprintf("drop function if exists %s", hookName)
 	err := ts.API.db.RawQuery(cleanupHookSQL).Exec()
 	require.NoError(ts.T(), err)
+}
+
+func (ts *MFATestSuite) TestMFAFactorEnrolledNotificationEnabled() {
+	ts.Config.Mailer.Notifications.MFAFactorEnrolledEnabled = true
+
+	// Get the mock mailer and reset it
+	mockMailer, ok := ts.Mailer.(*mockclient.MockMailer)
+	require.True(ts.T(), ok, "Mailer is not of type *MockMailer")
+	mockMailer.Reset()
+
+	res := performTestSignupAndVerify(ts, ts.TestEmail, ts.TestPassword, true /* <- requireStatusOK */)
+	accessTokenResp := &AccessTokenResponse{}
+	require.NoError(ts.T(), json.NewDecoder(res.Body).Decode(&accessTokenResp))
+
+	// Assert that MFA factor enrolled notification email was sent or not based on the config
+	require.Len(ts.T(), mockMailer.MFAFactorEnrolledMailCalls, 1, "Expected one MFA factor enrolled notification email(s) to be sent")
+	require.Equal(ts.T(), accessTokenResp.User.ID, mockMailer.MFAFactorEnrolledMailCalls[0].User.ID, "Email should be sent to the correct user")
+	require.Equal(ts.T(), models.TOTP, mockMailer.MFAFactorEnrolledMailCalls[0].FactorType, "Email should specify the correct factor type")
+}
+
+func (ts *MFATestSuite) TestMFAFactorEnrolledNotificationDisabled() {
+	ts.Config.Mailer.Notifications.MFAFactorEnrolledEnabled = false
+
+	// Get the mock mailer and reset it
+	mockMailer, ok := ts.Mailer.(*mockclient.MockMailer)
+	require.True(ts.T(), ok, "Mailer is not of type *MockMailer")
+	mockMailer.Reset()
+
+	res := performTestSignupAndVerify(ts, ts.TestEmail, ts.TestPassword, true /* <- requireStatusOK */)
+	accessTokenResp := &AccessTokenResponse{}
+	require.NoError(ts.T(), json.NewDecoder(res.Body).Decode(&accessTokenResp))
+
+	// Assert that MFA factor enrolled notification email was sent or not based on the config
+	require.Len(ts.T(), mockMailer.MFAFactorEnrolledMailCalls, 0, "Expected 0 MFA factor enrolled notification email(s) to be sent")
+}
+
+func (ts *MFATestSuite) TestMFAFactorUnenrolledNotificationEnabled() {
+	ts.Config.Mailer.Notifications.MFAFactorUnenrolledEnabled = true
+
+	// Get the mock mailer and reset it
+	mockMailer, ok := ts.Mailer.(*mockclient.MockMailer)
+	require.True(ts.T(), ok, "Mailer is not of type *MockMailer")
+	mockMailer.Reset()
+
+	var buffer bytes.Buffer
+	f := ts.TestUser.Factors[0]
+
+	token := ts.generateAAL1Token(ts.TestUser, &ts.TestSession.ID)
+	require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(map[string]interface{}{
+		"factor_id": f.ID,
+	}))
+
+	w := ServeAuthenticatedRequest(ts, http.MethodDelete, fmt.Sprintf("/factors/%s", f.ID), token, buffer)
+	require.Equal(ts.T(), http.StatusOK, w.Code)
+
+	_, err := models.FindFactorByFactorID(ts.API.db, f.ID)
+	require.EqualError(ts.T(), err, models.FactorNotFoundError{}.Error())
+	session, _ := models.FindSessionByID(ts.API.db, ts.TestSecondarySession.ID, false)
+	require.Equal(ts.T(), models.AAL1.String(), session.GetAAL())
+	require.Nil(ts.T(), session.FactorID)
+
+	// Assert that MFA factor unenrolled notification email was sent or not based on the config
+	require.Len(ts.T(), mockMailer.MFAFactorUnenrolledMailCalls, 1, "Expected one MFA factor unenrolled notification email(s) to be sent")
+	require.Equal(ts.T(), ts.TestUser.ID, mockMailer.MFAFactorUnenrolledMailCalls[0].User.ID, "Email should be sent to the correct user")
+	require.Equal(ts.T(), models.TOTP, mockMailer.MFAFactorUnenrolledMailCalls[0].FactorType, "Email should specify the correct factor type")
+}
+
+func (ts *MFATestSuite) TestMFAFactorUnenrolledNotificationDisabled() {
+	ts.Config.Mailer.Notifications.MFAFactorUnenrolledEnabled = false
+
+	// Get the mock mailer and reset it
+	mockMailer, ok := ts.Mailer.(*mockclient.MockMailer)
+	require.True(ts.T(), ok, "Mailer is not of type *MockMailer")
+	mockMailer.Reset()
+
+	var buffer bytes.Buffer
+	f := ts.TestUser.Factors[0]
+
+	token := ts.generateAAL1Token(ts.TestUser, &ts.TestSession.ID)
+	require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(map[string]interface{}{
+		"factor_id": f.ID,
+	}))
+
+	w := ServeAuthenticatedRequest(ts, http.MethodDelete, fmt.Sprintf("/factors/%s", f.ID), token, buffer)
+	require.Equal(ts.T(), http.StatusOK, w.Code)
+
+	_, err := models.FindFactorByFactorID(ts.API.db, f.ID)
+	require.EqualError(ts.T(), err, models.FactorNotFoundError{}.Error())
+	session, _ := models.FindSessionByID(ts.API.db, ts.TestSecondarySession.ID, false)
+	require.Equal(ts.T(), models.AAL1.String(), session.GetAAL())
+	require.Nil(ts.T(), session.FactorID)
+
+	// Assert that MFA factor unenrolled notification email was sent or not based on the config
+	require.Len(ts.T(), mockMailer.MFAFactorUnenrolledMailCalls, 0, "Expected 0 MFA factor unenrolled notification email(s) to be sent")
 }

@@ -1,13 +1,16 @@
 package models
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/supabase/auth/internal/conf"
+	"github.com/supabase/auth/internal/conf/confload"
 	"github.com/supabase/auth/internal/storage"
 	"github.com/supabase/auth/internal/storage/test"
 )
@@ -29,7 +32,7 @@ func (ts *SessionsTestSuite) SetupTest() {
 }
 
 func TestSession(t *testing.T) {
-	globalConfig, err := conf.LoadGlobal(modelsTestConfig)
+	globalConfig, err := confload.LoadGlobal(modelsTestConfig)
 	require.NoError(t, err)
 	conn, err := test.SetupDBConnection(globalConfig)
 	require.NoError(t, err)
@@ -159,4 +162,22 @@ func TestCheckValidity(t *testing.T) {
 			require.Equal(t, example.expected, example.session.CheckValidity(example.config, example.now, &example.now, example.highestPossibleAAL))
 		})
 	}
+}
+
+func TestSessionGetRefreshTokenHmacKey(t *testing.T) {
+	s, err := NewSession(uuid.Must(uuid.NewV4()), nil)
+	require.NoError(t, err)
+
+	hmacKey, shouldReEncrypt, err := s.GetRefreshTokenHmacKey(conf.DatabaseEncryptionConfiguration{})
+	require.NoError(t, err)
+	require.Nil(t, hmacKey)
+	require.False(t, shouldReEncrypt)
+
+	key := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	s.RefreshTokenHmacKey = &key
+
+	hmacKey, shouldReEncrypt, err = s.GetRefreshTokenHmacKey(conf.DatabaseEncryptionConfiguration{})
+	require.NoError(t, err)
+	require.Equal(t, make([]byte, 32), hmacKey)
+	require.False(t, shouldReEncrypt)
 }

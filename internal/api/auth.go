@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/gofrs/uuid"
 	jwt "github.com/golang-jwt/jwt/v5"
 	"github.com/supabase/auth/internal/api/apierrors"
+	"github.com/supabase/auth/internal/api/shared"
 	"github.com/supabase/auth/internal/conf"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/storage"
@@ -30,7 +32,13 @@ func (a *API) requireAuthentication(w http.ResponseWriter, r *http.Request) (con
 	if err != nil {
 		return ctx, err
 	}
-	return ctx, err
+
+	// Reject banned users who still hold an access token issued before the ban
+	if user := getUser(ctx); user != nil && user.IsBanned() {
+		return ctx, apierrors.NewForbiddenError(apierrors.ErrorCodeUserBanned, "User is banned")
+	}
+
+	return ctx, nil
 }
 
 func (a *API) requireNotAnonymous(w http.ResponseWriter, r *http.Request) (context.Context, error) {
@@ -51,19 +59,22 @@ func (a *API) requireAdmin(ctx context.Context) (context.Context, error) {
 
 	adminRoles := a.config.JWT.AdminRoles
 
-	if isStringInSlice(claims.Role, adminRoles) {
+	if slices.Contains(adminRoles, claims.Role) {
 		// successful authentication
 		return withAdminUser(ctx, &models.User{Role: claims.Role, Email: storage.NullString(claims.Role)}), nil
 	}
 
-	return nil, apierrors.NewForbiddenError(apierrors.ErrorCodeNotAdmin, "User not allowed").WithInternalMessage(fmt.Sprintf("this token needs to have one of the following roles: %v", strings.Join(adminRoles, ", ")))
+	return nil, apierrors.NewForbiddenError(apierrors.ErrorCodeNotAdmin, "User not allowed").
+		WithInternalMessage(
+			"this token needs to have one of the following roles: %v",
+			strings.Join(adminRoles, ", "))
 }
 
 func (a *API) extractBearerToken(r *http.Request) (string, error) {
 	authHeader := r.Header.Get("Authorization")
 	matches := bearerRegexp.FindStringSubmatch(authHeader)
 	if len(matches) != 2 {
-		return "", apierrors.NewHTTPError(http.StatusUnauthorized, apierrors.ErrorCodeNoAuthorization, "This endpoint requires a Bearer token")
+		return "", apierrors.NewHTTPError(http.StatusUnauthorized, apierrors.ErrorCodeNoAuthorization, "This endpoint requires a valid Bearer token")
 	}
 
 	return matches[1], nil
@@ -77,7 +88,7 @@ func (a *API) parseJWTClaims(bearer string, r *http.Request) (context.Context, e
 	token, err := p.ParseWithClaims(bearer, &AccessTokenClaims{}, func(token *jwt.Token) (interface{}, error) {
 		if kid, ok := token.Header["kid"]; ok {
 			if kidStr, ok := kid.(string); ok {
-				key, err := conf.FindPublicKeyByKid(kidStr, &config.JWT)
+				key, err := conf.FindPublicKeyByKid(ctx, kidStr, &config.JWT)
 				if err != nil {
 					return nil, err
 				}
@@ -141,11 +152,13 @@ func (a *API) maybeLoadUserOrSession(ctx context.Context) (context.Context, erro
 		session, err = models.FindSessionByID(db, sessionId, false)
 		if err != nil {
 			if models.IsNotFoundError(err) {
-				return ctx, apierrors.NewForbiddenError(apierrors.ErrorCodeSessionNotFound, "Session from session_id claim in JWT does not exist").WithInternalError(err).WithInternalMessage(fmt.Sprintf("session id (%s) doesn't exist", sessionId))
+				return ctx, apierrors.NewForbiddenError(apierrors.ErrorCodeSessionNotFound, "Session from session_id claim in JWT does not exist").WithInternalError(err).WithInternalMessage("session id (%s) doesn't exist", sessionId)
 			}
 			return ctx, err
 		}
 		ctx = withSession(ctx, session)
+		// Also store in shared context for cross-package access (e.g., oauthserver package)
+		ctx = shared.WithSession(ctx, session)
 	}
 	return ctx, nil
 }

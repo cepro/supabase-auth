@@ -6,12 +6,16 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/gofrs/uuid"
 	"github.com/mrjones/oauth"
 	"github.com/sirupsen/logrus"
 	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/api/provider"
+	"github.com/supabase/auth/internal/conf"
+	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/observability"
 	"github.com/supabase/auth/internal/utilities"
+	"golang.org/x/oauth2"
 )
 
 // OAuthProviderData contains the userData and token returned by the oauth provider
@@ -22,10 +26,12 @@ type OAuthProviderData struct {
 	code         string
 }
 
-// loadFlowState parses the `state` query parameter as a JWS payload,
-// extracting the provider requested
+// loadFlowState parses the `state` query parameter as a UUID,
+// loads the flow state from the database, and extracts the provider requested
 func (a *API) loadFlowState(w http.ResponseWriter, r *http.Request) (context.Context, error) {
 	ctx := r.Context()
+	db := a.db.WithContext(ctx)
+
 	oauthToken := r.URL.Query().Get("oauth_token")
 	if oauthToken != "" {
 		ctx = withRequestToken(ctx, oauthToken)
@@ -36,7 +42,7 @@ func (a *API) loadFlowState(w http.ResponseWriter, r *http.Request) (context.Con
 	}
 
 	var err error
-	ctx, err = a.loadExternalState(ctx, r)
+	ctx, err = a.loadExternalState(ctx, r, db)
 	if err != nil {
 		u, uerr := url.ParseRequestURI(a.config.SiteURL)
 		if uerr != nil {
@@ -52,6 +58,8 @@ func (a *API) loadFlowState(w http.ResponseWriter, r *http.Request) (context.Con
 }
 
 func (a *API) oAuthCallback(ctx context.Context, r *http.Request, providerType string) (*OAuthProviderData, error) {
+	db := a.db.WithContext(ctx)
+
 	var rq url.Values
 	if err := r.ParseForm(); r.Method == http.MethodPost && err == nil {
 		rq = r.Form
@@ -69,28 +77,56 @@ func (a *API) oAuthCallback(ctx context.Context, r *http.Request, providerType s
 		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeBadOAuthCallback, "OAuth callback with missing authorization code missing")
 	}
 
-	oAuthProvider, err := a.OAuthProvider(ctx, providerType)
+	oauthProvider, _, err := a.OAuthProvider(ctx, providerType)
 	if err != nil {
 		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeOAuthProviderNotSupported, "Unsupported provider: %+v", err).WithInternalError(err)
 	}
 
 	log := observability.GetLogEntry(r).Entry
+
+	var oauthClientState *models.OAuthClientState
+	// if there's a non-empty OAuthClientStateID we perform PKCE Flow for the external provider
+	if oauthClientStateID := getOAuthClientStateID(ctx); oauthClientStateID != uuid.Nil {
+		oauthClientState, err = models.FindAndDeleteOAuthClientStateByID(db, oauthClientStateID)
+		if models.IsNotFoundError(err) {
+			return nil, apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeOAuthClientStateNotFound, "OAuth state not found").WithInternalError(err)
+		} else if err != nil {
+			return nil, apierrors.NewInternalServerError("Failed to find OAuth state").WithInternalError(err)
+		}
+
+		if oauthClientState.ProviderType != providerType {
+			return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeOAuthInvalidState, "OAuth provider mismatch")
+		}
+
+		if oauthClientState.IsExpired() {
+			return nil, apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeOAuthClientStateExpired, "OAuth state expired")
+		}
+	}
+
+	if oauthProvider.RequiresPKCE() && oauthClientState == nil {
+		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeOAuthInvalidState, "OAuth PKCE code verifier missing")
+	}
+
 	log.WithFields(logrus.Fields{
 		"provider": providerType,
 		"code":     oauthCode,
-	}).Debug("Exchanging oauth code")
+	}).Debug("Exchanging OAuth code")
 
-	token, err := oAuthProvider.GetOAuthToken(oauthCode)
+	var tokenOpts []oauth2.AuthCodeOption
+	if oauthClientState != nil {
+		tokenOpts = append(tokenOpts, oauth2.VerifierOption(*oauthClientState.CodeVerifier))
+	}
+	token, err := oauthProvider.GetOAuthToken(ctx, oauthCode, tokenOpts...)
 	if err != nil {
-		return nil, apierrors.NewInternalServerError("Unable to exchange external code: %s", oauthCode).WithInternalError(err)
+		return nil, apierrors.NewInternalServerError("Unable to exchange external code: %s", oauthCode[:min(4, len(oauthCode))]).WithInternalError(err)
 	}
 
-	userData, err := oAuthProvider.GetUserData(ctx, token)
+	userData, err := oauthProvider.GetUserData(ctx, token)
 	if err != nil {
 		return nil, apierrors.NewInternalServerError("Error getting user profile from external provider").WithInternalError(err)
 	}
 
-	switch externalProvider := oAuthProvider.(type) {
+	switch externalProvider := oauthProvider.(type) {
 	case *provider.AppleProvider:
 		// apple only returns user info the first time
 		oauthUser := rq.Get("user")
@@ -111,7 +147,7 @@ func (a *API) oAuthCallback(ctx context.Context, r *http.Request, providerType s
 }
 
 func (a *API) oAuth1Callback(ctx context.Context, providerType string) (*OAuthProviderData, error) {
-	oAuthProvider, err := a.OAuthProvider(ctx, providerType)
+	oAuthProvider, _, err := a.OAuthProvider(ctx, providerType)
 	if err != nil {
 		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeOAuthProviderNotSupported, "Unsupported provider: %+v", err).WithInternalError(err)
 	}
@@ -141,16 +177,16 @@ func (a *API) oAuth1Callback(ctx context.Context, providerType string) (*OAuthPr
 }
 
 // OAuthProvider returns the corresponding oauth provider as an OAuthProvider interface
-func (a *API) OAuthProvider(ctx context.Context, name string) (provider.OAuthProvider, error) {
-	providerCandidate, err := a.Provider(ctx, name, "")
+func (a *API) OAuthProvider(ctx context.Context, name string) (provider.OAuthProvider, conf.OAuthProviderConfiguration, error) {
+	providerCandidate, pConfig, err := a.Provider(ctx, name, "")
 	if err != nil {
-		return nil, err
+		return nil, pConfig, err
 	}
 
 	switch p := providerCandidate.(type) {
 	case provider.OAuthProvider:
-		return p, nil
+		return p, pConfig, nil
 	default:
-		return nil, fmt.Errorf("Provider %v cannot be used for OAuth", name)
+		return nil, pConfig, fmt.Errorf("Provider %v cannot be used for OAuth", name)
 	}
 }

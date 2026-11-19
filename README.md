@@ -11,7 +11,7 @@ docker buildx inspect --bootstrap
 docker buildx build --platform linux/amd64,linux/arm64 --build-arg RELEASE_VERSION=2.197.0 -t ghcr.io/cepro/supabase-auth:v2.197.0 --push .
 ```
 
-Or let CI do it: pushing a `v*` tag (e.g. `git tag v2.197.0 && git push origin v2.197.0`) runs `.github/workflows/release.yml`, which builds and pushes the same multi-arch image.
+Or let CI do it: pushing a `v*` tag (e.g. `git tag v2.197.0 && git push origin v2.197.0`) runs `.github/workflows/release.yml`, which builds and pushes the image (currently amd64 only; see the comment in that workflow).
 
 Auth is a user management and authentication server written in Go that powers
 [Supabase](https://supabase.com)'s features such as:

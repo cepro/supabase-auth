@@ -24,7 +24,7 @@ func (a *API) SignupAnonymously(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	params.Aud = aud
-	params.Provider = "anonymous"
+	params.Provider = AnonymousProvider
 
 	newUser, err := params.ToUserModel(false /* <- isSSOUser */)
 	if err != nil {
@@ -44,7 +44,7 @@ func (a *API) SignupAnonymously(w http.ResponseWriter, r *http.Request) error {
 		if terr != nil {
 			return terr
 		}
-		token, terr = a.issueRefreshToken(r, tx, newUser, models.Anonymous, grantParams)
+		token, terr = a.issueRefreshToken(r, w.Header(), tx, newUser, models.Anonymous, grantParams)
 		if terr != nil {
 			return terr
 		}
@@ -52,6 +52,9 @@ func (a *API) SignupAnonymously(w http.ResponseWriter, r *http.Request) error {
 	})
 	if err != nil {
 		return apierrors.NewInternalServerError("Database error creating anonymous user").WithInternalError(err)
+	}
+	if err := a.triggerAfterUserCreated(r, db, newUser); err != nil {
+		return err
 	}
 
 	metering.RecordLogin(metering.LoginTypeAnonymous, newUser.ID, nil)

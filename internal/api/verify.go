@@ -11,6 +11,7 @@ import (
 
 	"github.com/fatih/structs"
 	"github.com/sethvargo/go-password/password"
+	"github.com/sirupsen/logrus"
 	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/api/provider"
 	"github.com/supabase/auth/internal/api/sms_provider"
@@ -181,7 +182,7 @@ func (a *API) verifyGet(w http.ResponseWriter, r *http.Request, params *VerifyPa
 		}
 
 		if isImplicitFlow(flowType) {
-			token, terr = a.issueRefreshToken(r, tx, user, models.OTP, grantParams)
+			token, terr = a.issueRefreshToken(r, w.Header(), tx, user, models.OTP, grantParams)
 			if terr != nil {
 				return terr
 			}
@@ -281,7 +282,7 @@ func (a *API) verifyPost(w http.ResponseWriter, r *http.Request, params *VerifyP
 		if terr := tx.Reload(user); terr != nil {
 			return terr
 		}
-		token, terr = a.issueRefreshToken(r, tx, user, models.OTP, grantParams)
+		token, terr = a.issueRefreshToken(r, w.Header(), tx, user, models.OTP, grantParams)
 		if terr != nil {
 			return terr
 		}
@@ -401,9 +402,12 @@ func (a *API) recoverVerify(r *http.Request, conn *storage.Connection, user *mod
 func (a *API) smsVerify(r *http.Request, conn *storage.Connection, user *models.User, params *VerifyParams) (*models.User, error) {
 	config := a.config
 
+	oldPhone := user.GetPhone()
+	phoneIdentityWasCreated := false
 	err := conn.Transaction(func(tx *storage.Connection) error {
 
-		if params.Type == smsVerification {
+		switch params.Type {
+		case smsVerification:
 			if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.UserSignedUpAction, "", map[string]interface{}{
 				"provider": PhoneProvider,
 			}); terr != nil {
@@ -412,22 +416,23 @@ func (a *API) smsVerify(r *http.Request, conn *storage.Connection, user *models.
 			if terr := user.ConfirmPhone(tx); terr != nil {
 				return apierrors.NewInternalServerError("Error confirming user").WithInternalError(terr)
 			}
-		} else if params.Type == phoneChangeVerification {
+		case phoneChangeVerification:
 			if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.UserModifiedAction, "", nil); terr != nil {
 				return terr
 			}
-			if identity, terr := models.FindIdentityByIdAndProvider(tx, user.ID.String(), "phone"); terr != nil {
+			if identity, terr := models.FindIdentityByIdAndProvider(tx, user.ID.String(), PhoneProvider); terr != nil {
 				if !models.IsNotFoundError(terr) {
 					return terr
 				}
 				// confirming the phone change should create a new phone identity if the user doesn't have one
-				if _, terr = a.createNewIdentity(tx, user, "phone", structs.Map(provider.Claims{
+				if _, terr = a.createNewIdentity(tx, user, PhoneProvider, structs.Map(provider.Claims{
 					Subject:       user.ID.String(),
 					Phone:         params.Phone,
 					PhoneVerified: true,
 				})); terr != nil {
 					return terr
 				}
+				phoneIdentityWasCreated = true
 			} else {
 				if terr := identity.UpdateIdentityData(tx, map[string]interface{}{
 					"phone":          params.Phone,
@@ -456,6 +461,23 @@ func (a *API) smsVerify(r *http.Request, conn *storage.Connection, user *models.
 	if err != nil {
 		return nil, err
 	}
+
+	// Send phone changed notification email if enabled and phone was changed
+	if params.Type == phoneChangeVerification && config.Mailer.Notifications.PhoneChangedEnabled && user.GetEmail() != "" && phoneNumberChanged(oldPhone, user.GetPhone()) {
+		if err := a.sendPhoneChangedNotification(r, conn, user, oldPhone); err != nil {
+			// Log the error but don't fail the verification
+			logrus.WithError(err).Warn("Unable to send phone changed notification email")
+		}
+	}
+
+	// Send identity linked notification email if a new phone identity was created
+	if phoneIdentityWasCreated && config.Mailer.Notifications.IdentityLinkedEnabled && user.GetEmail() != "" {
+		if err := a.sendIdentityLinkedNotification(r, conn, user, PhoneProvider); err != nil {
+			// Log the error but don't fail the verification
+			logrus.WithError(err).Warn("Unable to send identity linked notification email")
+		}
+	}
+
 	return user, nil
 }
 
@@ -486,6 +508,8 @@ func (a *API) prepErrorRedirectURL(err *HTTPError, r *http.Request, rurl string,
 		u.RawQuery = q.Encode()
 	}
 	// Left as hash fragment to comply with spec.
+	// Add Supabase Auth identifier to help clients distinguish Supabase Auth redirects
+	hq.Set("sb", "")
 	u.Fragment = hq.Encode()
 	return u.String(), nil
 }
@@ -502,6 +526,8 @@ func (a *API) prepRedirectURL(message string, rurl string, flowType models.FlowT
 		q.Set("message", message)
 	}
 	u.RawQuery = q.Encode()
+	// Add Supabase Auth identifier to help clients distinguish Supabase Auth redirects
+	hq.Set("sb", "")
 	u.Fragment = hq.Encode()
 	return u.String(), nil
 }
@@ -559,17 +585,18 @@ func (a *API) emailChangeVerify(r *http.Request, conn *storage.Connection, param
 	}
 
 	// one email is confirmed at this point if GOTRUE_MAILER_SECURE_EMAIL_CHANGE_ENABLED is enabled
+	oldEmail := user.GetEmail()
 	err := conn.Transaction(func(tx *storage.Connection) error {
 		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.UserModifiedAction, "", nil); terr != nil {
 			return terr
 		}
 
-		if identity, terr := models.FindIdentityByIdAndProvider(tx, user.ID.String(), "email"); terr != nil {
+		if identity, terr := models.FindIdentityByIdAndProvider(tx, user.ID.String(), EmailProvider); terr != nil {
 			if !models.IsNotFoundError(terr) {
 				return terr
 			}
 			// confirming the email change should create a new email identity if the user doesn't have one
-			if _, terr = a.createNewIdentity(tx, user, "email", structs.Map(provider.Claims{
+			if _, terr = a.createNewIdentity(tx, user, EmailProvider, structs.Map(provider.Claims{
 				Subject:       user.ID.String(),
 				Email:         user.EmailChange,
 				EmailVerified: true,
@@ -603,6 +630,14 @@ func (a *API) emailChangeVerify(r *http.Request, conn *storage.Connection, param
 		return nil, err
 	}
 
+	// send an Email Changed email notification to the user's old email address
+	if config.Mailer.Notifications.EmailChangedEnabled && emailAddressChanged(oldEmail, user.GetEmail()) {
+		if err := a.sendEmailChangedNotification(r, conn, user, oldEmail); err != nil {
+			// we don't want to fail the whole request if the email can't be sent
+			logrus.WithError(err).Warn("Unable to send email changed notification")
+		}
+	}
+
 	return user, nil
 }
 
@@ -614,13 +649,13 @@ func (a *API) verifyTokenHash(conn *storage.Connection, params *VerifyParams) (*
 	switch params.Type {
 	case mail.EmailOTPVerification:
 		// need to find user by confirmation token or recovery token with the token hash
-		user, err = models.FindUserByConfirmationOrRecoveryToken(conn, params.TokenHash)
+		user, err = models.FindUserByOneTimeToken(conn, params.TokenHash, models.ConfirmationToken, models.RecoveryToken)
 	case mail.SignupVerification, mail.InviteVerification:
-		user, err = models.FindUserByConfirmationToken(conn, params.TokenHash)
+		user, err = models.FindUserByOneTimeToken(conn, params.TokenHash, models.ConfirmationToken)
 	case mail.RecoveryVerification, mail.MagicLinkVerification:
-		user, err = models.FindUserByRecoveryToken(conn, params.TokenHash)
+		user, err = models.FindUserByOneTimeToken(conn, params.TokenHash, models.RecoveryToken)
 	case mail.EmailChangeVerification:
-		user, err = models.FindUserByEmailChangeToken(conn, params.TokenHash)
+		user, err = models.FindUserByOneTimeToken(conn, params.TokenHash, models.EmailChangeTokenCurrent, models.EmailChangeTokenNew)
 	default:
 		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Invalid email verification type")
 	}
@@ -770,4 +805,14 @@ func isEmailOtpVerification(params *VerifyParams) bool {
 
 func isUsingTokenHash(params *VerifyParams) bool {
 	return params.TokenHash != "" && params.Token == "" && params.Phone == "" && params.Email == ""
+}
+
+// emailAddressChanged checks if the email address has changed, ensuring neither is empty
+func emailAddressChanged(oldEmail, newEmail string) bool {
+	return oldEmail != "" && newEmail != "" && oldEmail != newEmail
+}
+
+// phoneNumberChanged checks if the phone number has changed, ensuring neither is empty
+func phoneNumberChanged(oldPhone, newPhone string) bool {
+	return oldPhone != "" && newPhone != "" && oldPhone != newPhone
 }

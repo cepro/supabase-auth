@@ -5,11 +5,12 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/supabase/auth/internal/conf"
 	"golang.org/x/oauth2"
 )
 
-const IssuerSnapchat = "https://accounts.snapchat.com"
+const IssuerSnapchat = "https://accounts.snapchat.com/accounts/oauth2/token"
 
 const (
 	defaultSnapchatAuthBase  = "accounts.snapchat.com"
@@ -30,6 +31,7 @@ type snapchatUser struct {
 			Bitmoji     struct {
 				Avatar string `json:"avatar"`
 			} `json:"bitmoji"`
+			Email string `json:"email"`
 		} `json:"me"`
 	} `json:"data"`
 }
@@ -69,8 +71,12 @@ func NewSnapchatProvider(ext conf.OAuthProviderConfiguration, scopes string) (OA
 	}, nil
 }
 
-func (p snapchatProvider) GetOAuthToken(code string) (*oauth2.Token, error) {
-	return p.Exchange(context.Background(), code)
+func (p snapchatProvider) GetOAuthToken(ctx context.Context, code string, opts ...oauth2.AuthCodeOption) (*oauth2.Token, error) {
+	return p.Exchange(ctx, code, opts...)
+}
+
+func (p snapchatProvider) RequiresPKCE() bool {
+	return false
 }
 
 func (p snapchatProvider) GetUserData(ctx context.Context, tok *oauth2.Token) (*UserProvidedData, error) {
@@ -84,7 +90,7 @@ func (p snapchatProvider) GetUserData(ctx context.Context, tok *oauth2.Token) (*
 
 	// Add the GraphQL query parameter
 	query := url.Values{}
-	query.Add("query", "{me { externalId displayName bitmoji { avatar id } } }")
+	query.Add("query", "{me { externalId displayName bitmoji { avatar id } email } }")
 	baseURL.RawQuery = query.Encode()
 
 	if err := makeRequest(ctx, tok, p.Config, baseURL.String(), &u); err != nil {
@@ -93,12 +99,13 @@ func (p snapchatProvider) GetUserData(ctx context.Context, tok *oauth2.Token) (*
 
 	data := &UserProvidedData{}
 
-	// Snapchat doesn't provide email by default, additional scopes needed
-	data.Emails = []Email{{
-		Email:    strings.ToLower(u.Data.Me.ExternalID) + "@snapchat.id", // TODO: Create a pseudo-email using the external ID
-		Verified: true,
-		Primary:  true,
-	}}
+	if u.Data.Me.Email != "" {
+		data.Emails = []Email{{
+			Email:    u.Data.Me.Email,
+			Verified: true,
+			Primary:  true,
+		}}
+	}
 
 	data.Metadata = &Claims{
 		Issuer:  IssuerSnapchat,
@@ -114,4 +121,24 @@ func (p snapchatProvider) GetUserData(ctx context.Context, tok *oauth2.Token) (*
 	}
 
 	return data, nil
+}
+
+func parseSnapchatIDToken(token *oidc.IDToken) (*oidc.IDToken, *UserProvidedData, error) {
+	var data UserProvidedData
+
+	if err := token.Claims(&data.Metadata); err != nil {
+		return nil, nil, err
+	}
+
+	if data.Metadata.Email != "" {
+		data.Emails = append(data.Emails, Email{
+			Email:    data.Metadata.Email,
+			Verified: true,
+			Primary:  true,
+		})
+
+		data.Metadata.EmailVerified = true
+	}
+
+	return token, &data, nil
 }
